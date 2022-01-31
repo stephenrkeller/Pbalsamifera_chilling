@@ -1,0 +1,681 @@
+---
+title: "UpdatedChillingScript"
+author: "Ethan Thibault (ET) and Stephen Keller (SRK)"
+date: "11/4/2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=F}
+### Functions ###
+
+# Function adopted from: http://www.sthda.com/english/wiki/ggplot2-error-bars-quick-start-guide-r-software-and-data-visualization
+# SRK modified this function in order to calculate the standard error of the mean, labeled 'sem'
+
+#+++++++++++++++++++++++++
+# Function to calculate the mean and the standard deviation
+# for each group
+#+++++++++++++++++++++++++
+# data : a data frame
+# varname : the name of a column containing the variable
+# to be summarized
+# groupnames : vector of column names to be used as
+# grouping variables
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE),
+      den = sqrt(length(x[[col]])-1))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+```
+
+```{r, echo=F}
+# Loading required libraries
+library(ggplot2)
+library(gridExtra)
+library(lme4)
+library(lmerTest)
+library(sjPlot)
+library(sjmisc)
+library(MuMIn)
+library(RColorBrewer)
+library(MCMCglmm)
+```
+
+```{r,echo=FALSE}
+
+chill <- read.csv("data/ChillingExpt.csv", header=T)
+
+# Data are recorded in Julian dates; to determine # days to bud flush, create a vector of Jul Day start of each week and subtract
+subtractor <- c(0,0,5,12,19,26,33,40,47,54,61,68,75)
+
+# create a for loop that will subract the correct value from each column
+for (i in 3:13) {
+  chill[,i] <- chill[,i] - subtractor[i]
+}
+  
+# Expand data to long format:
+chill2 <- reshape(chill, varying=3:13, sep="_", direction="long")
+```
+
+Now convert to the proper physiological units of degree days.
+
+First, estimate cumulative chilling degree days (cCDD) for our experiment based on Eq(1) in Kramer et al. 1994 (Appendix)
+
+**NOTE** -- To account for chilling experienced outside during fall/winter 2017 prior to collection, we downloaded BTV airport climate data from Sep 01, 2017 - Jan 04, 2018, and summed the cCDD experienced by genotypes outside in the planter before they were sampled and placed into the cold room.
+
+```{r}
+# Retrieve climate data from local BTV airport
+BTV <- read.csv("data/BTV_climate_Sep17_Jan18.csv")
+cCDD2017 <- data.frame(cCDD = rep(NA, 196))
+cCDD2017[1,] <- 0
+
+# Apply Kramer's chilling degree model. Only temps -3.4 < T <= 10.4 count towards cCDD
+for(i in 2:126) {
+  T[i] = BTV$TAVG[i]
+  if( T[i] > -3.4 && T[i] <= 3.5) {
+    cCDD2017$cCDD[i] = (T[i]-(-3.4))/(3.5-(-3.4)) + cCDD2017$cCDD[i-1]
+  } else if( T[i] > 3.5 && T[i] <= 10.4) {
+    cCDD2017$cCDD[i] = (T[i]-10.4)/(3.5-10.4) + cCDD2017$cCDD[i-1]
+  } else { cCDD2017$cCDD[i] = cCDD2017$cCDD[i-1] }
+}
+
+for (i in 1:70) {
+  cCDD2017$cCDD[126+i] = cCDD2017$cCDD[126+i-1] + (4-10.4)/(3.5-10.4)
+}
+
+plot(cCDD2017$cCDD)
+```
+
+In the above plot, I set Day0 = September 1, 2017 (arbitrary date used by others; should be prior to any significant chilling accumulation in Fall).
+
+Note chilling begins to accumulate ~ Day48, increasing up to late December and then leveling off (gets too cold!), before increasing linearly thereafter in the cold room at 4C.
+
+Now, convert time to cCDD for the experiment and run models with variables in proper physiological units:
+```{r,echo=F}
+cCDDExpt <- data.frame(cCDD = rep(NA, 11))
+cCDDExpt[1,] = cCDD2017$cCDD[126]
+cCDDExpt$time = seq(0,10,by=1)
+
+for (i in 1:10){
+  cCDDExpt$cCDD[i+1] = cCDD2017$cCDD[(126+i*7)]
+}
+# calculate cGDD
+chill2 <- merge(chill2, cCDDExpt, by="time")
+chill2$cGDD = chill2$JulBF*10
+
+```
+
+Add lat and longs
+
+```{r}
+# Retrieve lat/longs for these individuals
+
+load("data/lats.RData") # vector "lats"
+chill4 <- merge(chill2, lats, by.x="ind_code", by.y="location_id", all.x=F)
+chill4$Latitude = floor(chill4$latitude)
+```
+
+Add BioClim data and test models with latitude or temperature predictors: 
+
+####Linear mixed effects models to test effects of chilling treatment on time to BF
+
+**Reponse:**
+
+* cGDD to bud flush
+
+**Predictors:**
+
+* cCDD = fixed
+* Latitude = fixed
+* ind_code = random (intecept or intercept + slope)
+
+####Model1: JulBF as a function of time, with random intercepts
+```{r, echo=F}
+model1 <- lmer(cGDD~cCDD + (1|ind_code), data=chill4, na.action = na.exclude)
+summary(model1)
+r.squaredGLMM(model1)
+```
+
+####Model2 looks at JulBF as a function of time. Random intercept and slope varying among ind_code (i.e., is there genetic variation for the response to chilling?)
+
+```{r, echo=F}
+model2 <- lmer(cGDD~cCDD + (1+cCDD|ind_code), data=chill4, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model2)
+r.squaredGLMM(model2)
+
+anova(model1, model2)
+
+plot <- plot_model(model2, type="eff", terms=c("cCDD"), value.size=120, axis.title=c("cCDD","cGDD"),col=brewer.pal(10, "Spectral"), title = "Random intercept and slope")
+# title="Effect of chilling degree days and latitude on cGDD to bud flush"
+print(plot)
+
+```
+
+Model 2 fits data better, indicating that intercept (days to BF) and slope (response to chilling) both significantly differ with genotype, indicating a GxE
+
+```{r}
+
+model3 <- lmer(cGDD~cCDD*Latitude + (1|ind_code), data=chill4, na.action = na.exclude, control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+summary(model3)
+r.squaredGLMM(model3)
+                                                                                                                 
+model4 <- lmer(cGDD~cCDD+Latitude + (1+cCDD|ind_code), data=chill4, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model4)
+r.squaredGLMM(model4)
+
+anova(model2, model4)
+
+p3 <- plot_model(model3, type="pred", terms=c("cCDD","Latitude"),  line.size=1.5, axis.title=c("Chilling (cCDD)","cGDD to Bud Flush"), col=brewer.pal(5, "Spectral"), title="") + 
+    ylim(50,500) + xlim(20,90) +
+    theme_classic(base_size = 8) +
+    annotate("text", label = "B", x = 80, y = 450, size = 5, colour = "black")
+
+# Plot the averaged data with standard error
+chillavg2 <- data_summary(chill4, varname="cGDD", 
+                    groupnames=c("cCDD","ind_code","Latitude"))
+chillavg2 <- transform(chillavg2, ind_code=reorder(ind_code, Latitude) ) 
+chillavg2$sem = chillavg2$sd/chillavg2$den
+p4<- ggplot(chillavg2, aes(x=cCDD, y=cGDD, group=ind_code, color=ind_code)) + 
+  scale_colour_brewer(palette = "Spectral") +
+  geom_line() +
+  geom_point()+
+  geom_errorbar(aes(ymin=cGDD-sem, ymax=cGDD+sem), width=.15,
+                position=position_dodge(0.05)) + 
+  ylim(50,500) + xlim(20,90) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background =element_blank(), axis.line = element_line(colour = "black")) + 
+  labs(x="",y="cGDD to Bud Flush",colour="Genotype") +
+  annotate("text", label = "A", x = 85, y = 450, size = 5, colour = "black") +
+  theme_classic(base_size = 8)
+#print(p4)
+
+P <- grid.arrange(p4,p3,ncol = 1)
+```
+
+Test effect of removing week6 chilling data due to growth chamber malfunction.  Run same mixed effect models as before but with this set of points removed.
+
+```{r}
+
+chill4R <- chill4[which(chill4$time!=6),]
+
+# Plot the averaged data with standard error
+chillavg2R <- data_summary(chill4R, varname="cGDD", 
+                    groupnames=c("cCDD","ind_code","Latitude"))
+chillavg2R <- transform(chillavg2R, ind_code=reorder(ind_code, Latitude) ) 
+chillavg2R$sem = chillavg2R$sd/chillavg2R$den
+p4R<- ggplot(chillavg2R, aes(x=cCDD, y=cGDD, group=ind_code, color=ind_code)) + 
+  scale_colour_brewer(palette = "Spectral") +
+  geom_line() +
+  geom_point()+
+  geom_errorbar(aes(ymin=cGDD-sem, ymax=cGDD+sem), width=.15,
+                position=position_dodge(0.05)) + 
+  ylim(50,500) + xlim(20,90) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background =element_blank(), axis.line = element_line(colour = "black")) + 
+  labs(x="",y="cGDD to Bud Flush",colour="Genotype") +
+  annotate("text", label = "A", x = 85, y = 450, size = 5, colour = "black") +
+  theme_classic(base_size = 8)
+print(p4R)
+
+
+  
+model1R <- lmer(cGDD~cCDD + (1|ind_code), data=chill4R, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+summary(model1R)
+r.squaredGLMM(model1R)
+
+model2R <- lmer(cGDD~cCDD + (1+cCDD|ind_code), data=chill4R, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model2R)
+r.squaredGLMM(model2R)
+
+anova(model1R, model2R)
+
+model3R <- lmer(cGDD~cCDD*Latitude + (1|ind_code), data=chill4R, na.action = na.exclude, control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+summary(model3R)
+r.squaredGLMM(model3R)
+
+anova(model1R, model3R)
+                                                                                                       
+                                                                                                      
+model4R <- lmer(cGDD~cCDD+Latitude + (1+cCDD|ind_code), data=chill4R, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model4R)
+r.squaredGLMM(model4R)
+
+anova(model2R, model4R)
+
+```
+
+Estimate broad-sense heritability of bud flush timing per week
+
+```{r}
+# Start of QG estimation of heritability: This section commented out of the Rmarkdown version b/c it requires a very long run-time
+
+
+# Define priors
+# pr = list(R = list(V = 1, n = 0.002),
+#           G = list(G1 = list(V = 1, n = 0.002)))
+
+# Define models in loop through weeks chilling
+# #W0 <- MCMCglmm(cGDD ~ 1, 
+#                 random = ~ ind_code, 
+#                 family = 'gaussian',
+#                 data = chill4[which(chill4$time==0),],
+#                 prior = pr,
+#                 verbose = TRUE,
+#                 pr = TRUE,
+#                 burnin = 50000,
+#                 nitt = 200000,
+#                 thin = 500)
+# 
+# hsq <- (W0$VCV[,"ind_code"])/(W0$VCV[,"ind_code"] + W0$VCV[,"units"] )
+# Vg = W0$VCV[,"ind_code"]
+# Vp = W0$VCV[,"ind_code"] + W0$VCV[,"units"]
+# week = 0
+# Hsq_all <- data.frame(week,Vp,Vg,hsq) # Initialize df holding the posterior estimates 
+# names(Hsq_all) = c("week","Vp","Vg","H2")
+# 
+# 
+# for(i in 1:10){
+# 
+#   data = chill4[which(chill4$time==i),]
+# 
+#   model <- MCMCglmm(cGDD ~ 1, 
+#                 random = ~ ind_code, 
+#                 family = 'gaussian',
+#                 data = data,
+#                 prior = pr,
+#                 verbose = TRUE,
+#                 pr = TRUE,
+#                 burnin = 50000,
+#                 nitt = 200000,
+#                 thin = 500)
+# 
+# # Calculate the Bayesian broad-sense heritability (H^2)
+# H2_ <- (model$VCV[,"ind_code"])/(model$VCV[,"ind_code"] + model$VCV[,"units"] )
+# Vg_ = model$VCV[,"ind_code"]
+# Vp_ = model$VCV[,"ind_code"] + model$VCV[,"units"]
+# week_ = i
+# Hsq_ <- data.frame(week_,Vp_,Vg_,H2_)
+# names(Hsq_) = c("week","Vp","Vg","H2")
+# Hsq_all <- rbind(Hsq_all,Hsq_)
+# }
+# 
+# H2plot <- ggplot(Hsq_all, aes(x=week, group=week, y =H2)) + geom_boxplot() + xlab("Chilling weeks") + ylab("Broad-sense Heritability")
+# 
+# Vgplot <- ggplot(Hsq_all, aes(x=week, group=week, y =scale(Vg))) + geom_boxplot() + xlab("Chilling weeks") + ylab("Standardized Vg")
+# 
+# Vpplot <- ggplot(Hsq_all, aes(x=week, group=week, y =scale(Vp))) + geom_boxplot() + xlab("Chilling weeks") + ylab("Standardized Vp")
+# 
+# All <- grid.arrange(H2plot,Vgplot,Vpplot, nrow = 3)
+# ggsave("Figure2.pdf", width = 6, height = 10, plot=All,device = "pdf")
+# 
+# 
+# data_summary2 <- function(x) {
+#    m <- median(x)
+#    ymin <- m-sd(x) #quantile(x,prob=0.025)
+#    ymax <- m+sd(x) #quantile(x,prob=0.975)
+#    return(c(y=m,ymin=ymin,ymax=ymax))
+# }
+# 
+# p <- ggplot(Hsq_all, aes(x=as.factor(week), y=H2)) + 
+#   geom_violin(trim=F)
+# p + stat_summary(fun.y=median, geom="point", size=2, color="red")
+# p + stat_summary(fun.data="data_summary2",col="red" )
+```
+
+#########################################################################################################
+
+Is the association with source environment better if we explicitly consider climate instead of latitude, or does latitude (which integrates photoperiod) provide a better environmental cue for predicting timing of bud flush? 
+
+```{r}
+library(raster)
+library(sp)
+
+load("data/Bio1.RData") # Bio1 clim data
+dataType(Bio1) <- "INT2S"
+
+lats <- as.vector(chill4$latitude)
+longs <- as.vector(chill4$longitude)
+coords <- data.frame(x=longs,y=lats)
+
+points <- SpatialPoints(coords, proj4string = Bio1@crs)
+MAT <- extract(Bio1,points)
+df <- cbind.data.frame(coordinates(points),MAT)
+
+chill5 <- cbind.data.frame(chill4,MAT)
+```
+
+Now lets add Bio11 --> Mean Temperature of Coldest Quarter
+```{r}
+load("data/Bio11.RData") # Bio11 clim data
+dataType(Bio11) <- "INT2S"
+
+MTCQ <- extract(Bio11,points)
+chill5 <- cbind.data.frame(chill5,MTCQ)
+
+```
+
+Let's run the same model structure as determined to be optimal based on Latitude (model 4 above) but using MAT and MTCQ in place of Latitude as environmental predictors:
+
+
+```{r}
+#MAT:
+chill5$MAT10 <- chill5$MAT/10
+model5 <- lmer(cGDD~cCDD+MAT10 + (1+cCDD|ind_code), data=chill5, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model5)
+r.squaredGLMM(model5)
+
+# MTCQ:
+chill5$MTCQ10 <- chill5$MTCQ/10
+model6 <- lmer(cGDD~cCDD+MTCQ10 + (1+cCDD|ind_code), data=chill5, na.action = na.exclude, control=lmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+summary(model6)
+r.squaredGLMM(model6)
+
+AIC(model1, model2, model3, model4, model5, model6)
+
+```
+
+We're interested in calculating the average number of chilling degree days for each genotype in its home environment.  We'll do this based on the NASA MODIS estimate of spring greenup, also known as the start of spring ("sos").  The sos estimate is from Andrew Elmore (Elmore et al. 2016, Remote Sensing 5:802), based on his fitted phenology model to MODIS data for Populus stands in North America.
+
+```{r}
+load("data/HistoricChilling.RData")
+  
+# Build a nested loop to calculate chilling
+# make sos days a whole number
+sos$m3 <- round(sos$m3)
+
+# build vector of years and genotypes
+Genotypes <- c("LON_03","LON_11","CPL_03","CPL_10","HWK_11","HWK_14","SKN_05","SKN_11","FNO_12","FNO_15")
+years <- c("2001","2002","2003","2004","2005","2006","2007","2008","2009","2010","2011","2012","2013","2014","2015","2016")
+
+Tmin <- -3.4
+Topt <- 3.5
+Tmax <- 10.4
+
+# Chilling accumulation parameters:
+# if T is less than or equal to Tmin then you get 0 chilling
+# if T is greater than Tmin and less than or equal to Topt you get T-Tmin/Topt-Tmin chilling
+# if T is greater than Topt and less then Tmax you get T-Tmax/Topt-Tmax chilling
+# if T is greater than or equal to Tmax you get 0 chilling
+
+genoyearcCDD <- data.frame(matrix(ncol = 10,nrow = 16))
+colnames(genoyearcCDD) <- Genotypes
+rownames(genoyearcCDD) <- years
+
+for (i in 1:length(Genotypes)){
+  for (j in 1:length(years)){
+    tavgtmp <- vector()
+    #tmpsos = 335
+    tmpsos <- sos[which(sos$location_id == Genotypes[i] & sos$year == years[j]),3]
+    tavgtmp <- append(x=tavgtmp, values = clim[which(clim$location_id == Genotypes[i] & clim$year == years[j] & clim$doy < tmpsos),6])
+    tavgtmp <- append(x=tavgtmp, values = clim[which(clim$location_id == Genotypes[i] & clim$year == years[j-1] & clim$doy >= 244),6])
+    tmpcCDD <- vector()
+    for (k in 1:length(tavgtmp)){
+      if (tavgtmp[k] > Tmin & tavgtmp[k] <= Topt){
+        tmpcCDD <- append(x=tmpcCDD, values = (tavgtmp[k]-Tmin)/(Topt-Tmin))}
+        else if(tavgtmp[k] > Topt & tavgtmp[k] < Tmax){
+          tmpcCDD <- append(x=tmpcCDD, values = (tavgtmp[k]-Tmax)/(Topt-Tmax))}
+          else {tmpcCDD <- append(x=tmpcCDD, values=0)}
+    }
+    genoyearcCDD[years[j],Genotypes[i]] <- sum(tmpcCDD)
+  }
+}
+
+genomeans <- as.vector(colMeans(x=genoyearcCDD))
+
+library(matrixStats)
+genosd <- colSds(as.matrix(genoyearcCDD))
+plot(genomeans)
+
+# Calculate standard error
+genose <- vector()
+for (i in 1:length(genosd)){
+  genose <- append(x=genose, values=genosd[i]/sqrt(10))
+}
+
+finaldf <- data.frame(Genotype=character(length(Genotypes)),Average=numeric(length(Genotypes)),SD=numeric(length(Genotypes)),SE=numeric(length(Genotypes)))
+finaldf$Genotype <- Genotypes
+finaldf$Average <- genomeans
+finaldf$SD <- genosd
+finaldf$SE <- genose
+
+ggplot(finaldf, aes(x=reorder(Genotype, -Average), y=Average, fill=Genotype)) + 
+  geom_bar(position=position_dodge(), stat = "Identity") + 
+  geom_errorbar(aes(ymin=Average-SD, ymax=Average+SD),
+                width=.2,
+                position=position_dodge(.9))
+
+ggplot(finaldf, aes(x=reorder(Genotype, -Average), y=Average, fill=Genotype)) + 
+  geom_bar(position=position_dodge(), stat = "Identity") + 
+  geom_errorbar(aes(ymin=Average-SE, ymax=Average+SE),
+                width=.2,
+                position=position_dodge(.9))
+
+```
+
+I think it would help some if we visualized the climate data at each site, in terms of temp min, max, and averages for daily values over the years of record, and include the range of chilling temps and estimated sos for each genotype.
+
+```{r}
+# > aggregate(sos$m3, by=list(sos$location_id), FUN=mean)
+#    Group.1        x
+# 1   CPL_03 128.2353
+# 2   CPL_10 129.0000
+# 3   FNO_12 119.2353
+# 4   FNO_15 119.1765
+# 5   HWK_11 140.5882
+# 6   HWK_14 149.8235
+# 7   LON_03 122.4118
+# 8   LON_11 118.3529
+# 9   SKN_05 136.7647
+# 10  SKN_11 132.1176
+
+clim.tmp <- aggregate(clim, by=list(clim$location_id,clim$doy), FUN=mean)
+
+pdf("AppendixS2.pdf", width=10, height=12)
+par(mfrow=c(5,2),mar=c(4, 5, 2, 1))
+
+# LON_03
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab = expression(paste("Temperature, ",degree,"C")), mtext("LON_03", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="LON_03" & clim$doy<=160),3], clim[which(clim$location_id=="LON_03" & clim$doy<=160),4],col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="LON_03")
+points(clim[which(clim$location_id=="LON_03" & clim$doy<=160),3], clim[which(clim$location_id=="LON_03" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="LON_03")
+points(clim.tmp[which(clim.tmp$Group.1=="LON_03" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="LON_03" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=122,col="black",lwd=2, lty=3)
+
+# LON_11
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3,  xlab="", ylab ="", mtext("LON_11", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="LON_11" & clim$doy<=160),3], clim[which(clim$location_id=="LON_11" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="LON_11")
+points(clim[which(clim$location_id=="LON_11" & clim$doy<=160),3], clim[which(clim$location_id=="LON_11" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="LON_11")
+points(clim.tmp[which(clim.tmp$Group.1=="LON_11" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="LON_11" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=118,col="black",lwd=2, lty=3)
+
+# CPL_03
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab = expression(paste("Temperature, ",degree,"C")), mtext("CPL_03", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="CPL_03" & clim$doy<=160),3], clim[which(clim$location_id=="CPL_03" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="CPL_03")
+points(clim[which(clim$location_id=="CPL_03" & clim$doy<=160),3], clim[which(clim$location_id=="CPL_03" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="CPL_03")
+points(clim.tmp[which(clim.tmp$Group.1=="CPL_03" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="CPL_03" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=128,col="black",lwd=2, lty=3)
+
+# CPL_10
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3,  xlab="", ylab ="", mtext("CPL_10", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="CPL_10" & clim$doy<=160),3], clim[which(clim$location_id=="CPL_10" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="CPL_10")
+points(clim[which(clim$location_id=="CPL_10" & clim$doy<=160),3], clim[which(clim$location_id=="CPL_10" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="CPL_10")
+points(clim.tmp[which(clim.tmp$Group.1=="CPL_10" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="CPL_10" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=129,col="black",lwd=2, lty=3)
+
+# HWK_11
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab = expression(paste("Temperature, ",degree,"C")), mtext("HWK_11", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="HWK_11" & clim$doy<=160),3], clim[which(clim$location_id=="HWK_11" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="HWK_11")
+points(clim[which(clim$location_id=="HWK_11" & clim$doy<=160),3], clim[which(clim$location_id=="HWK_11" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="HWK_11")
+points(clim.tmp[which(clim.tmp$Group.1=="HWK_11" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="HWK_11" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=141,col="black",lwd=2, lty=3)
+
+# HWK_14
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3,  xlab="", ylab ="", mtext("HWK_14", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="HWK_14" & clim$doy<=160),3], clim[which(clim$location_id=="HWK_14" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="HWK_14")
+points(clim[which(clim$location_id=="HWK_14" & clim$doy<=160),3], clim[which(clim$location_id=="HWK_14" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="HWK_14")
+points(clim.tmp[which(clim.tmp$Group.1=="HWK_14" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="HWK_14" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=150,col="black",lwd=2, lty=3)
+
+# SKN_05
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab = expression(paste("Temperature, ",degree,"C")), mtext("SKN_05", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="SKN_05" & clim$doy<=160),3], clim[which(clim$location_id=="SKN_05" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="SKN_05")
+points(clim[which(clim$location_id=="SKN_05" & clim$doy<=160),3], clim[which(clim$location_id=="SKN_05" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="SKN_05")
+points(clim.tmp[which(clim.tmp$Group.1=="SKN_05" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="SKN_05" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=137,col="black",lwd=2, lty=3)
+
+# SKN_10
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3,  xlab="", ylab ="", mtext("SKN_10", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="SKN_11" & clim$doy<=160),3], clim[which(clim$location_id=="SKN_11" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="SKN_11")
+points(clim[which(clim$location_id=="SKN_11" & clim$doy<=160),3], clim[which(clim$location_id=="SKN_11" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="SKN_11")
+points(clim.tmp[which(clim.tmp$Group.1=="SKN_11" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="SKN_11" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=132,col="black",lwd=2, lty=3)
+
+# FNO_12
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab = expression(paste("Temperature, ",degree,"C")), mtext("FNO_12", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="FNO_12" & clim$doy<=160),3], clim[which(clim$location_id=="FNO_12" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="FNO_12")
+points(clim[which(clim$location_id=="FNO_12" & clim$doy<=160),3], clim[which(clim$location_id=="FNO_12" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="FNO_12")
+points(clim.tmp[which(clim.tmp$Group.1=="FNO_12" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="FNO_12" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=119,col="black",lwd=2, lty=3)
+
+# FNO_15
+plot(0,0,col="transparent", xlim=c(0,160),ylim=c(-50,40), cex.lab=1.3, cex.axis=1.3, xlab="Day of year", ylab ="", mtext("FNO_15", side=3, adj=1, line=0, cex=1.2))
+rect(-10, -3.4, 170, 10, col = gray(0.5,alpha=0.3))
+points(clim[which(clim$location_id=="FNO_15" & clim$doy<=160),3], clim[which(clim$location_id=="FNO_15" & clim$doy<=160),4], col=rgb(red = 1, green = 0, blue = 0, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="FNO_15")
+points(clim[which(clim$location_id=="FNO_15" & clim$doy<=160),3], clim[which(clim$location_id=="FNO_15" & clim$doy<=160),5], col=rgb(red = 0, green = 0, blue = 1, alpha = 0.2), ylim=c(-50,40), xlab="Julian Day", ylab="T (degC)", main="FNO_15")
+points(clim.tmp[which(clim.tmp$Group.1=="FNO_15" & clim.tmp$doy<=160),5], clim.tmp[which(clim.tmp$Group.1=="FNO_15" & clim.tmp$doy<=160),8], type="l", lwd=2)
+abline(v=119,col="black",lwd=2, lty=3)
+
+dev.off()
+
+```
+
+Responding to reviewer's request to integrate exposure to winter GDD (forcing temps) in historical climate data as a measure of selection for increased dormancy length as an adaptation against precious flushing.
+
+How to think about this?
+
+* What is the cGDD above some base temperature Tb (0, 5, 10.4?) up to the date of sos?  Sites with lots off GDD before historic bud flush would be keen to evolve longer dormancy.  
+
+* Estimate historic frost risk.  Here, I used 1981-2000 climate normals from https://climate.weather.gc.ca/climate_normals/index_e.html  to find the date corresponding to the median (50%) probability of a temp 0C or lower in spring. Let's call this DLF50 (day last freeze, 50% probability)
+
+* Pick a Tb threshold for accumulating forcing days.  Let's say 0C (follows from Tb used elsewhere in this paper and Olson et al. (2013) for forcing temperatures)
+
+* use DayMet daily data calculate the cGDD>Tb=0 from Jan 01 -> DFL50 (or a calendar date)
+
+* After doing all this, we saw that MODIS sos is actually earlier than DLF50.  Since they are flushing already, it doesn't make sense to use DLF50 in the cGDD>Tb calc.  So, use a JulDay calendar date as the cutoff, such as last day in March (JulDay=90).  Somewhat arbitrary, but we want to measure warm days occuring in *winter*, not during the onset of spring.
+
+```{r}
+#DLF50 <- c(126,126,151,151,152,152,140,140,143,143)
+#frost_df <- data.frame(Genotypes, DLF50)
+
+Tb = 0
+
+genoyearWintercGDD <- data.frame(matrix(ncol = 10,nrow = 16))
+colnames(genoyearWintercGDD) <- Genotypes
+rownames(genoyearWintercGDD) <- years
+
+for (i in 1:length(Genotypes)){
+  for (j in 1:length(years)){
+    tavgtmp <- vector()
+    tmpsos <- 90
+    #tmpsos <- sos[which(sos$location_id == Genotypes[i] & sos$year == years[j]),3]
+    tavgtmp <- append(x=tavgtmp, values = clim[which(clim$location_id == Genotypes[i] & clim$year == years[j] & clim$doy <= tmpsos),6])
+    #tavgtmp <- append(x=tavgtmp, values = clim[which(clim$location_id == Genotypes[i] & clim$year == years[j] & clim$doy < frost_df[which(frost_df$Genotypes == Genotypes[i]),2]),6])
+    #tavgtmp <- append(x=tavgtmp, values = clim[which(clim$location_id == Genotypes[i] & clim$year == years[j-1] & clim$doy >=335),6])
+    tmpWintercGDD <- vector()
+    for (k in 1:length(tavgtmp)){
+      if (tavgtmp[k] > Tb){
+        tmpWintercGDD <- append(x=tmpWintercGDD, values = (tavgtmp[k]-Tb))}
+          else {tmpWintercGDD <- append(x=tmpWintercGDD, values=0)}
+    }
+    genoyearWintercGDD[years[j],Genotypes[i]] <- sum(tmpWintercGDD)
+  }
+}
+      
+genomeans <- as.vector(colMeans(x=genoyearWintercGDD))
+genosd <- colSds(as.matrix(genoyearWintercGDD))
+
+# Calculate standard deviation and plot
+genose <- vector()
+for (i in 1:length(genosd)){
+  genose <- append(x=genose, values=genosd[i]/sqrt(10))
+}
+
+finaldf <- data.frame(Genotype=character(length(Genotypes)),Average=numeric(length(Genotypes)),SD=numeric(length(Genotypes)),SE=numeric(length(Genotypes)))
+finaldf$Genotype <- Genotypes
+finaldf$AvgWinterGDD <- genomeans
+finaldf$SDWinterGDD <- genosd
+finaldf$SEWinterGDD <- genose
+
+finaldf
+
+ggplot(finaldf, aes(x=reorder(Genotype, -AvgWinterGDD), y=AvgWinterGDD, fill=Genotype)) + 
+  geom_bar(position=position_dodge(), stat = "Identity") + 
+  geom_errorbar(aes(ymin=AvgWinterGDD-SDWinterGDD, ymax=AvgWinterGDD+SDWinterGDD),
+                width=.2,
+                position=position_dodge(.9))
+
+```
+
+Use AvgWinterGDD as predictor in bud flush models
+
+```{r}
+
+finaldf[8,1]="SKN_10"
+chill7 <- merge(chill5, finaldf, by.x="ind_code", by.y="Genotype")
+
+
+chill7$AvgWinterGDD <- round(chill7$AvgWinterGDD)
+
+chill7$logWGDD <- log(chill7$AvgWinterGDD)
+
+model9 <- lmer(cGDD~cCDD*AvgWinterGDD + (1|ind_code), data=chill7, na.action = na.exclude, control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+summary(model9)
+r.squaredGLMM(model9)
+
+model10 <- lmer(cGDD~cCDD + AvgWinterGDD + (cCDD|ind_code), data=chill7, na.action = na.exclude, control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+
+summary(model10)
+r.squaredGLMM(model10)
+
+mp3 <- plot_model(model9, type="eff", terms=c("cCDD","AvgWinterGDD"), value.size=120, axis.title=c("cCDD","cGDD"), title="Mean Winter GDD", col=rev(brewer.pal(7, "Spectral")))
+print(mp3)
+
+library(ggpubr)
+
+ggarrange(mp1,mp2,mp3, ncol = 1,nrow = 3,labels=c("A","B","C"))
+ggsave("AppendixS3.pdf", width = 6, height = 10)
+
+
+```
+
+
+
+
